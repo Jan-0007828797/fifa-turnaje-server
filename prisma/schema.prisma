@@ -1,0 +1,92 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Tournament {
+  id         String     @id @default(cuid())
+  name       String
+  buyIn      Int
+  status     String     @default("draft")
+  createdBy  String
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+  players    Player[]
+  matches    Match[]
+  auditLogs  AuditLog[]
+}
+
+model Player {
+  id           String      @id @default(cuid())
+  tournamentId String
+  slot         String
+  name         String
+  createdAt    DateTime    @default(now())
+  tournament    Tournament  @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  matchesA1    Match[]     @relation("teamA1")
+  matchesA2    Match[]     @relation("teamA2")
+  matchesB1    Match[]     @relation("teamB1")
+  matchesB2    Match[]     @relation("teamB2")
+  matchesBench1 Match[]    @relation("bench1")
+  matchesBench2 Match[]    @relation("bench2")
+
+  @@unique([tournamentId, slot])
+}
+
+model Match {
+  id              String        @id @default(cuid())
+  tournamentId    String
+  order           Int
+  teamAPlayer1Id  String
+  teamAPlayer2Id  String
+  teamBPlayer1Id  String
+  teamBPlayer2Id  String
+  benchPlayer1Id  String
+  benchPlayer2Id  String
+  scoreA          Int?
+  scoreB          Int?
+  overtimeWinner  String?
+  auctionA        Int           @default(0)
+  auctionB        Int           @default(0)
+  footballTeamAId String?
+  footballTeamBId String?
+  updatedAt       DateTime      @updatedAt
+  tournament      Tournament    @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  teamAPlayer1    Player        @relation("teamA1", fields: [teamAPlayer1Id], references: [id])
+  teamAPlayer2    Player        @relation("teamA2", fields: [teamAPlayer2Id], references: [id])
+  teamBPlayer1    Player        @relation("teamB1", fields: [teamBPlayer1Id], references: [id])
+  teamBPlayer2    Player        @relation("teamB2", fields: [teamBPlayer2Id], references: [id])
+  benchPlayer1    Player        @relation("bench1", fields: [benchPlayer1Id], references: [id])
+  benchPlayer2    Player        @relation("bench2", fields: [benchPlayer2Id], references: [id])
+  footballTeamA   FootballTeam? @relation("matchTeamA", fields: [footballTeamAId], references: [id])
+  footballTeamB   FootballTeam? @relation("matchTeamB", fields: [footballTeamBId], references: [id])
+
+  @@unique([tournamentId, order])
+}
+
+model FootballTeam {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  country     String
+  competition String
+  type        String
+  matchesA    Match[]  @relation("matchTeamA")
+  matchesB    Match[]  @relation("matchTeamB")
+}
+
+model AuditLog {
+  id           String    @id @default(cuid())
+  tournamentId String
+  action       String
+  entityType   String
+  entityId     String
+  changedBy    String
+  oldValue     Json?
+  newValue     Json?
+  createdAt    DateTime  @default(now())
+  tournament    Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+}
