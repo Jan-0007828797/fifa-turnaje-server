@@ -8,6 +8,7 @@ const { PrismaClient } = require('@prisma/client');
 const { ALLOWED_USERS, MATCH_PATTERN } = require('./constants');
 const { tournamentResponse, calculateTournament } = require('./calc');
 const { buildTournamentWorkbook } = require('./export');
+const { teamCatalog } = require('./teamCatalog');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -93,6 +94,16 @@ async function loadTournament(id) {
   });
   if (!tournament) return null;
   return tournamentResponse(tournament);
+}
+
+
+async function ensureTeamCatalog() {
+  const count = await prisma.footballTeam.count();
+  if (count >= teamCatalog.length) return;
+  await prisma.footballTeam.createMany({
+    data: teamCatalog.map(([name, country, competition, type]) => ({ name, country, competition, type })),
+    skipDuplicates: true
+  });
 }
 
 async function logAudit(tournamentId, action, entityType, entityId, changedBy, oldValue, newValue) {
@@ -223,7 +234,8 @@ app.post('/api/auth/login', (req, res) => {
 app.get('/api/me', auth, (req, res) => res.json({ user: req.user }));
 
 app.get('/api/teams', auth, async (_req, res) => {
-  const teams = await prisma.footballTeam.findMany({ orderBy: [{ type: 'asc' }, { country: 'asc' }, { name: 'asc' }] });
+  await ensureTeamCatalog();
+  const teams = await prisma.footballTeam.findMany({ orderBy: [{ country: 'asc' }, { competition: 'asc' }, { name: 'asc' }] });
   res.json(teams);
 });
 
