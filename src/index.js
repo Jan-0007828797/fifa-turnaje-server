@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -7,7 +6,7 @@ const { Server } = require('socket.io');
 const http = require('http');
 const { PrismaClient } = require('@prisma/client');
 const { ALLOWED_USERS, MATCH_PATTERN } = require('./constants');
-const { tournamentResponse } = require('./calc');
+const { tournamentResponse, calculateTournament } = require('./calc');
 const { buildTournamentWorkbook } = require('./export');
 
 const prisma = new PrismaClient();
@@ -53,6 +52,7 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: '2mb' }));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fifa-turnaje-dev-secret';
+const NOJBY_PASSWORD = 'Nojby1';
 
 function signToken(name) {
   return jwt.sign({ name, isNojby: name === 'Nojby' }, JWT_SECRET, { expiresIn: '30d' });
@@ -68,6 +68,11 @@ function auth(req, res, next) {
   } catch {
     return res.status(401).json({ error: 'Invalid token' });
   }
+}
+
+function requireNojby(req, res, next) {
+  if (!req.user?.isNojby) return res.status(403).json({ error: 'Tuto akci může provést jen Nojby' });
+  return next();
 }
 
 async function loadTournament(id) {
@@ -109,6 +114,91 @@ function tournamentSummary(t) {
   };
 }
 
+function computeStatsFromClosedTournaments(tournaments) {
+  const byPlayer = new Map();
+  const history = [];
+
+  for (const tournament of tournaments) {
+    const calc = calculateTournament(tournament);
+    const standings = calc.standings;
+    const finance = calc.finance;
+    const topScorers = new Set(calc.topScorers);
+    const topDefenses = new Set(calc.topDefenses);
+
+    for (const row of standings) {
+      if (!byPlayer.has(row.name)) {
+        byPlayer.set(row.name, {
+          name: row.name,
+          tournaments: 0,
+          firstPlaces: 0,
+          podiums: 0,
+          points: 0,
+          goalsFor: 0,
+          goalsAgainst: 0,
+          goalDiff: 0,
+          matchesPlayed: 0,
+          net: 0,
+          topScorerAwards: 0,
+          topDefenseAwards: 0
+        });
+      }
+      const bucket = byPlayer.get(row.name);
+      const financeRow = finance.find((item) => item.playerId === row.playerId);
+      bucket.tournaments += 1;
+      bucket.firstPlaces += row.position === 1 ? 1 : 0;
+      bucket.podiums += row.position <= 3 ? 1 : 0;
+      bucket.points += row.points;
+      bucket.goalsFor += row.goalsFor;
+      bucket.goalsAgainst += row.goalsAgainst;
+      bucket.goalDiff += row.goalDiff;
+      bucket.matchesPlayed += row.played;
+      bucket.net += financeRow?.net || 0;
+      bucket.topScorerAwards += topScorers.has(row.name) ? 1 : 0;
+      bucket.topDefenseAwards += topDefenses.has(row.name) ? 1 : 0;
+
+      history.push({
+        tournamentId: tournament.id,
+        tournamentName: tournament.name,
+        status: tournament.status,
+        updatedAt: tournament.updatedAt,
+        createdAt: tournament.createdAt,
+        playerName: row.name,
+        position: row.position,
+        sharedPosition: row.sharedPosition,
+        points: row.points,
+        goalsFor: row.goalsFor,
+        goalsAgainst: row.goalsAgainst,
+        goalDiff: row.goalDiff,
+        net: financeRow?.net || 0,
+        totalRevenue: financeRow?.totalRevenue || 0,
+        totalCosts: financeRow?.totalCosts || 0,
+        placementPrize: financeRow?.placementPrize || 0,
+        topScorerPrize: financeRow?.topScorerPrize || 0,
+        topDefensePrize: financeRow?.topDefensePrize || 0
+      });
+    }
+  }
+
+  const players = Array.from(byPlayer.values()).sort((a, b) => (
+    b.firstPlaces - a.firstPlaces ||
+    b.podiums - a.podiums ||
+    b.points - a.points ||
+    b.goalDiff - a.goalDiff ||
+    a.name.localeCompare(b.name, 'cs')
+  ));
+
+  const overview = {
+    closedTournaments: tournaments.length,
+    totalNet: players.reduce((sum, player) => sum + player.net, 0),
+    totalGoals: players.reduce((sum, player) => sum + player.goalsFor, 0),
+    totalMatches: players.reduce((sum, player) => sum + player.matchesPlayed, 0)
+  };
+
+  history.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt) || a.playerName.localeCompare(b.playerName, 'cs'));
+
+  return { overview, players, history };
+}
+
 io.on('connection', (socket) => {
   socket.on('join-tournament', (tournamentId) => {
     socket.join(`tournament:${tournamentId}`);
@@ -123,7 +213,8 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body || {};
-  if (!ALLOWED_USERS.includes(username) || password !== username) {
+  const expectedPassword = username === 'Nojby' ? NOJBY_PASSWORD : username;
+  if (!ALLOWED_USERS.includes(username) || password !== expectedPassword) {
     return res.status(401).json({ error: 'Neplatné přihlášení' });
   }
   return res.json({ token: signToken(username), user: { name: username, isNojby: username === 'Nojby' } });
@@ -137,8 +228,32 @@ app.get('/api/teams', auth, async (_req, res) => {
 });
 
 app.get('/api/tournaments', auth, async (_req, res) => {
-  const tournaments = await prisma.tournament.findMany({ include: { players: true }, orderBy: { updatedAt: 'desc' } });
+  const tournaments = await prisma.tournament.findMany({
+    where: { status: { not: 'archived' } },
+    include: { players: true },
+    orderBy: { updatedAt: 'desc' }
+  });
   res.json(tournaments.map(tournamentSummary));
+});
+
+app.get('/api/stats', auth, async (_req, res) => {
+  const tournaments = await prisma.tournament.findMany({
+    where: { status: 'closed' },
+    include: {
+      players: true,
+      matches: {
+        include: {
+          teamAPlayer1: true, teamAPlayer2: true,
+          teamBPlayer1: true, teamBPlayer2: true,
+          benchPlayer1: true, benchPlayer2: true,
+          footballTeamA: true, footballTeamB: true
+        },
+        orderBy: { order: 'asc' }
+      }
+    },
+    orderBy: { updatedAt: 'desc' }
+  });
+  res.json(computeStatsFromClosedTournaments(tournaments));
 });
 
 app.post('/api/tournaments', auth, async (req, res) => {
@@ -194,6 +309,7 @@ app.patch('/api/tournaments/:id', auth, async (req, res) => {
   const { name, buyIn, players } = req.body || {};
   const current = await prisma.tournament.findUnique({ where: { id: req.params.id }, include: { players: true } });
   if (!current) return res.status(404).json({ error: 'Turnaj nenalezen' });
+  if (current.status === 'closed') return res.status(400).json({ error: 'Uzavřený turnaj už nelze upravovat' });
 
   await prisma.tournament.update({
     where: { id: req.params.id },
@@ -218,16 +334,43 @@ app.patch('/api/tournaments/:id', auth, async (req, res) => {
   res.json(full);
 });
 
+app.patch('/api/tournaments/:id/status', auth, requireNojby, async (req, res) => {
+  const { status } = req.body || {};
+  if (!['closed', 'archived'].includes(status)) {
+    return res.status(400).json({ error: 'Neplatný status turnaje' });
+  }
+  const current = await prisma.tournament.findUnique({ where: { id: req.params.id } });
+  if (!current) return res.status(404).json({ error: 'Turnaj nenalezen' });
+
+  const updated = await prisma.tournament.update({
+    where: { id: req.params.id },
+    data: { status }
+  });
+  await logAudit(req.params.id, status === 'closed' ? 'close' : 'archive', 'tournament', req.params.id, req.user.name, current, updated);
+  io.to(`tournament:${req.params.id}`).emit('tournament-updated');
+  res.json(await loadTournament(req.params.id));
+});
+
+app.delete('/api/tournaments/:id', auth, requireNojby, async (req, res) => {
+  const current = await prisma.tournament.findUnique({ where: { id: req.params.id } });
+  if (!current) return res.status(404).json({ error: 'Turnaj nenalezen' });
+
+  await logAudit(req.params.id, 'delete', 'tournament', req.params.id, req.user.name, current, null);
+  await prisma.tournament.delete({ where: { id: req.params.id } });
+  io.to(`tournament:${req.params.id}`).emit('tournament-updated');
+  res.json({ ok: true });
+});
+
 app.patch('/api/matches/:id', auth, async (req, res) => {
   const current = await prisma.match.findUnique({
     where: { id: req.params.id },
-    include: { footballTeamA: true, footballTeamB: true }
+    include: { footballTeamA: true, footballTeamB: true, tournament: true }
   });
   if (!current) return res.status(404).json({ error: 'Zápas nenalezen' });
+  if (current.tournament?.status === 'closed') return res.status(400).json({ error: 'Uzavřený turnaj už nelze upravovat' });
 
   const { scoreA, scoreB, overtimeWinner, auctionA, auctionB, footballTeamAId, footballTeamBId } = req.body || {};
 
-  // unique team within tournament
   if (footballTeamAId || footballTeamBId) {
     const used = await prisma.match.findMany({
       where: {
@@ -258,32 +401,29 @@ app.patch('/api/matches/:id', auth, async (req, res) => {
   if (tournament?.status === 'draft' && updated.scoreA != null && updated.scoreB != null) {
     await prisma.tournament.update({ where: { id: current.tournamentId }, data: { status: 'in_progress' } });
   }
+
   await logAudit(current.tournamentId, 'update', 'match', current.id, req.user.name, current, updated);
-  const full = await loadTournament(current.tournamentId);
   io.to(`tournament:${current.tournamentId}`).emit('tournament-updated');
-  res.json(full);
+  res.json(await loadTournament(current.tournamentId));
 });
 
 app.get('/api/tournaments/:id/audit', auth, async (req, res) => {
-  if (req.user.name !== 'Nojby') return res.status(403).json({ error: 'Pouze Nojby může zobrazit audit' });
-  const rows = await prisma.auditLog.findMany({
-    where: { tournamentId: req.params.id },
-    orderBy: { createdAt: 'desc' }
-  });
+  if (!req.user.isNojby) return res.status(403).json({ error: 'Pouze Nojby může číst audit' });
+  const rows = await prisma.auditLog.findMany({ where: { tournamentId: req.params.id }, orderBy: { createdAt: 'desc' } });
   res.json(rows);
 });
 
 app.get('/api/tournaments/:id/export', auth, async (req, res) => {
   const tournament = await loadTournament(req.params.id);
   if (!tournament) return res.status(404).json({ error: 'Turnaj nenalezen' });
-  const workbook = await buildTournamentWorkbook(tournament);
+  const workbook = buildTournamentWorkbook(tournament);
+  const buffer = await workbook.xlsx.writeBuffer();
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', `attachment; filename="fifa-turnaj-${req.params.id}.xlsx"`);
-  await workbook.xlsx.write(res);
-  res.end();
+  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(tournament.name)}.xlsx"`);
+  res.send(Buffer.from(buffer));
 });
 
-const port = Number(process.env.PORT || 4000);
-server.listen(port, () => {
-  console.log(`FIFA turnaje server running on port ${port}`);
+const PORT = Number(process.env.PORT || 4000);
+server.listen(PORT, () => {
+  console.log(`API listening on :${PORT}`);
 });
