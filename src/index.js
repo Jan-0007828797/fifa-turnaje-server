@@ -55,6 +55,113 @@ app.use(express.json({ limit: '2mb' }));
 const JWT_SECRET = process.env.JWT_SECRET || 'fifa-turnaje-dev-secret';
 const NOJBY_PASSWORD = 'Nojby1';
 
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || 'gpt-5.4';
+
+function normalizeText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\b(fc|cf|sc|afc|if|bk|ac|as|sv|fk|club|de|cd)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function scoreCandidateName(teamName, candidate) {
+  const base = normalizeText(teamName);
+  const probe = normalizeText(candidate);
+  if (!base || !probe) return 0;
+  if (base === probe) return 100;
+  if (base.includes(probe) || probe.includes(base)) return 92;
+  const baseWords = new Set(base.split(' '));
+  const probeWords = probe.split(' ').filter(Boolean);
+  const hits = probeWords.filter((word) => baseWords.has(word)).length;
+  if (!probeWords.length) return 0;
+  return Math.round((hits / probeWords.length) * 80);
+}
+
+function matchTeamByName(teams, candidate) {
+  if (!candidate) return null;
+  let best = null;
+  for (const team of teams) {
+    const score = scoreCandidateName(team.name, candidate);
+    if (!best || score > best.score) best = { team, score };
+  }
+  return best && best.score >= 55 ? best : null;
+}
+
+function extractJsonBlock(text) {
+  const source = String(text || '');
+  const start = source.indexOf('{');
+  const end = source.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(source.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+async function extractTeamsFromImage(imageDataUrl, teams) {
+  if (!OPENAI_API_KEY) {
+    throw new Error('Na serveru chybí OPENAI_API_KEY pro čtení týmů z fotky');
+  }
+
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: OPENAI_VISION_MODEL,
+      input: [{
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text:
+              'Na fotce je výběr týmů v EA SPORTS FC 26 na TV obrazovce. Najdi pouze dva zvolené mužské týmy. ' +
+              'Vrať jen JSON ve tvaru {"homeTeam":"...","awayTeam":"..."}. ' +
+              'Použij co nejpřesnější oficiální názvy. Dostupné týmy jsou: ' + teams.map((team) => team.name).join(', ')
+          },
+          {
+            type: 'input_image',
+            image_url: imageDataUrl
+          }
+        ]
+      }],
+      max_output_tokens: 200
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`AI čtení fotky selhalo: ${errorText}`);
+  }
+
+  const data = await response.json();
+  const outputText = data.output_text || data.output?.map((item) => {
+    if (item.type !== 'message') return '';
+    return (item.content || []).map((part) => part.text || '').join(' ');
+  }).join(' ');
+  const parsed = extractJsonBlock(outputText);
+  if (!parsed?.homeTeam || !parsed?.awayTeam) {
+    throw new Error('Z fotky se nepodařilo spolehlivě přečíst oba týmy');
+  }
+
+  const homeMatch = matchTeamByName(teams, parsed.homeTeam);
+  const awayMatch = matchTeamByName(teams, parsed.awayTeam);
+  return {
+    raw: parsed,
+    homeMatch,
+    awayMatch
+  };
+}
+
 function signToken(name) {
   return jwt.sign({ name, isNojby: name === 'Nojby' }, JWT_SECRET, { expiresIn: '30d' });
 }
@@ -379,7 +486,7 @@ app.patch('/api/matches/:id', auth, async (req, res) => {
     include: { footballTeamA: true, footballTeamB: true, tournament: true }
   });
   if (!current) return res.status(404).json({ error: 'Zápas nenalezen' });
-  if (current.tournament?.status === 'closed') return res.status(400).json({ error: 'Uzavřený turnaj už nelze upravovat' });
+  if (current.tournament?.status === 'closed' && !req.user?.isNojby) return res.status(400).json({ error: 'Uzavřený turnaj už nelze upravovat' });
 
   const { scoreA, scoreB, overtimeWinner, auctionA, auctionB, footballTeamAId, footballTeamBId } = req.body || {};
 
@@ -417,6 +524,34 @@ app.patch('/api/matches/:id', auth, async (req, res) => {
   await logAudit(current.tournamentId, 'update', 'match', current.id, req.user.name, current, updated);
   io.to(`tournament:${current.tournamentId}`).emit('tournament-updated');
   res.json(await loadTournament(current.tournamentId));
+});
+
+
+app.post('/api/matches/:id/extract-teams', auth, async (req, res) => {
+  await ensureTeamCatalog();
+  const { imageDataUrl } = req.body || {};
+  if (!imageDataUrl || typeof imageDataUrl !== 'string') {
+    return res.status(400).json({ error: 'Chybí fotka pro vytěžení týmů' });
+  }
+
+  const current = await prisma.match.findUnique({ where: { id: req.params.id }, include: { tournament: true } });
+  if (!current) return res.status(404).json({ error: 'Zápas nenalezen' });
+  if (current.tournament?.status === 'closed' && !req.user?.isNojby) {
+    return res.status(400).json({ error: 'Uzavřený turnaj už nelze upravovat' });
+  }
+
+  const teams = await prisma.footballTeam.findMany({ orderBy: [{ country: 'asc' }, { competition: 'asc' }, { name: 'asc' }] });
+  try {
+    const detected = await extractTeamsFromImage(imageDataUrl, teams);
+    return res.json({
+      homeTeamId: detected.homeMatch?.team.id || '',
+      awayTeamId: detected.awayMatch?.team.id || '',
+      rawHomeTeam: detected.raw.homeTeam,
+      rawAwayTeam: detected.raw.awayTeam
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'Čtení týmů z fotky selhalo' });
+  }
 });
 
 app.get('/api/tournaments/:id/audit', auth, async (req, res) => {
