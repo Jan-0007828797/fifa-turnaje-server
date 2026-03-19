@@ -50,13 +50,14 @@ const corsOptions = {
 const io = new Server(server, { cors: corsOptions });
 
 app.use(cors(corsOptions));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '12mb' }));
+app.use(express.urlencoded({ extended: true, limit: '12mb' }));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fifa-turnaje-dev-secret';
 const NOJBY_PASSWORD = 'Nojby1';
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || 'gpt-5.4';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || process.env.OPEN_API_KEY || '';
+const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
 function normalizeText(value) {
   return String(value || '')
@@ -93,6 +94,68 @@ function matchTeamByName(teams, candidate) {
   return best && best.score >= 55 ? best : null;
 }
 
+function dataUrlBytes(dataUrl) {
+  const payload = String(dataUrl || '').split(',')[1] || '';
+  return Buffer.byteLength(payload, 'base64');
+}
+
+function sanitizeDataUrl(dataUrl) {
+  const value = String(dataUrl || '').trim();
+  if (!/^data:image\/(png|jpeg|jpg|webp);base64,/i.test(value)) {
+    throw new Error('Fotka musí být PNG, JPG nebo WEBP ve formátu base64');
+  }
+  const bytes = dataUrlBytes(value);
+  if (bytes > 8 * 1024 * 1024) {
+    throw new Error('Fotka je příliš velká i po kompresi. Zkus být blíž TV nebo udělat menší výřez.');
+  }
+  return value;
+}
+
+async function callOpenAIChatVision(imageDataUrl, teams) {
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: OPENAI_VISION_MODEL,
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text:
+              'Na fotce je výběr týmů v EA SPORTS FC 26 na TV obrazovce. Najdi pouze dva zvolené mužské týmy. ' +
+              'Vrať jen JSON ve tvaru {"homeTeam":"...","awayTeam":"..."}. ' +
+              'Neuváděj žádný další text. Dostupné týmy jsou: ' + teams.map((team) => team.name).join(', ')
+          },
+          {
+            type: 'image_url',
+            image_url: { url: imageDataUrl, detail: 'low' }
+          }
+        ]
+      }],
+      max_completion_tokens: 200
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`AI čtení fotky selhalo: ${errorText}`);
+  }
+
+  const data = await response.json();
+  const outputText = data.choices?.[0]?.message?.content || '';
+  const parsed = extractJsonBlock(outputText);
+  if (!parsed?.homeTeam || !parsed?.awayTeam) {
+    throw new Error('Z fotky se nepodařilo spolehlivě přečíst oba týmy');
+  }
+  return parsed;
+}
+
 function extractJsonBlock(text) {
   const source = String(text || '');
   const start = source.indexOf('{');
@@ -110,55 +173,70 @@ async function extractTeamsFromImage(imageDataUrl, teams) {
     throw new Error('Na serveru chybí OPENAI_API_KEY pro čtení týmů z fotky');
   }
 
-  const response = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${OPENAI_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: OPENAI_VISION_MODEL,
-      input: [{
-        role: 'user',
-        content: [
-          {
-            type: 'input_text',
-            text:
-              'Na fotce je výběr týmů v EA SPORTS FC 26 na TV obrazovce. Najdi pouze dva zvolené mužské týmy. ' +
-              'Vrať jen JSON ve tvaru {"homeTeam":"...","awayTeam":"..."}. ' +
-              'Použij co nejpřesnější oficiální názvy. Dostupné týmy jsou: ' + teams.map((team) => team.name).join(', ')
-          },
-          {
-            type: 'input_image',
-            image_url: imageDataUrl
-          }
-        ]
-      }],
-      max_output_tokens: 200
-    })
-  });
+  const safeImageDataUrl = sanitizeDataUrl(imageDataUrl);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`AI čtení fotky selhalo: ${errorText}`);
-  }
+  let parsed = null;
+  let firstError = null;
 
-  const data = await response.json();
-  const outputText = data.output_text || data.output?.map((item) => {
-    if (item.type !== 'message') return '';
-    return (item.content || []).map((part) => part.text || '').join(' ');
-  }).join(' ');
-  const parsed = extractJsonBlock(outputText);
-  if (!parsed?.homeTeam || !parsed?.awayTeam) {
-    throw new Error('Z fotky se nepodařilo spolehlivě přečíst oba týmy');
+  try {
+    const response = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: OPENAI_VISION_MODEL,
+        input: [{
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text:
+                'Na fotce je výběr týmů v EA SPORTS FC 26 na TV obrazovce. Najdi pouze dva zvolené mužské týmy. ' +
+                'Vrať jen JSON ve tvaru {"homeTeam":"...","awayTeam":"..."}. ' +
+                'Použij co nejpřesnější oficiální názvy. Dostupné týmy jsou: ' + teams.map((team) => team.name).join(', ')
+            },
+            {
+              type: 'input_image',
+              image_url: safeImageDataUrl
+            }
+          ]
+        }],
+        max_output_tokens: 200
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(errorText);
+    }
+
+    const data = await response.json();
+    const outputText = data.output_text || data.output?.map((item) => {
+      if (item.type !== 'message') return '';
+      return (item.content || []).map((part) => part.text || '').join(' ');
+    }).join(' ');
+    parsed = extractJsonBlock(outputText);
+    if (!parsed?.homeTeam || !parsed?.awayTeam) {
+      throw new Error('Responses API nevrátila čitelné JSON týmy');
+    }
+  } catch (err) {
+    firstError = err;
+    parsed = await callOpenAIChatVision(safeImageDataUrl, teams);
   }
 
   const homeMatch = matchTeamByName(teams, parsed.homeTeam);
   const awayMatch = matchTeamByName(teams, parsed.awayTeam);
+  if (!homeMatch || !awayMatch) {
+    throw new Error('Týmy na fotce se nepodařilo bezpečně spárovat s databází FC 26');
+  }
+
   return {
     raw: parsed,
     homeMatch,
-    awayMatch
+    awayMatch,
+    warning: firstError ? String(firstError.message || firstError) : ''
   };
 }
 
@@ -547,10 +625,13 @@ app.post('/api/matches/:id/extract-teams', auth, async (req, res) => {
       homeTeamId: detected.homeMatch?.team.id || '',
       awayTeamId: detected.awayMatch?.team.id || '',
       rawHomeTeam: detected.raw.homeTeam,
-      rawAwayTeam: detected.raw.awayTeam
+      rawAwayTeam: detected.raw.awayTeam,
+      warning: detected.warning || ''
     });
   } catch (err) {
-    return res.status(500).json({ error: err.message || 'Čtení týmů z fotky selhalo' });
+    const message = String(err?.message || 'Čtení týmů z fotky selhalo');
+    const status = /chyb[ií] OPENAI_API_KEY/i.test(message) ? 503 : /příliš velká|formatu base64/i.test(message) ? 413 : 500;
+    return res.status(status).json({ error: message });
   }
 });
 
