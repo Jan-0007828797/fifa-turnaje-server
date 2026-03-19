@@ -18,7 +18,9 @@
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
     "prisma": "^6.7.0",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "sharp": "^0.33.5",
+    "tesseract.js": "^5.1.1"
   },
   "engines": {
     "node": ">=20"

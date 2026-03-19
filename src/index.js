@@ -5,6 +5,8 @@ const jwt = require('jsonwebtoken');
 const { Server } = require('socket.io');
 const http = require('http');
 const { PrismaClient } = require('@prisma/client');
+const sharp = require('sharp');
+const Tesseract = require('tesseract.js');
 const { ALLOWED_USERS, MATCH_PATTERN } = require('./constants');
 const { tournamentResponse, calculateTournament } = require('./calc');
 const { buildTournamentWorkbook } = require('./export');
@@ -50,48 +52,44 @@ const corsOptions = {
 const io = new Server(server, { cors: corsOptions });
 
 app.use(cors(corsOptions));
-app.use(express.json({ limit: '12mb' }));
-app.use(express.urlencoded({ extended: true, limit: '12mb' }));
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fifa-turnaje-dev-secret';
 const NOJBY_PASSWORD = 'Nojby1';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY || process.env.OPEN_API_KEY || '';
 const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+const OCR_ENABLED = process.env.DISABLE_LOCAL_OCR !== '1';
+
+const TEAM_ALIASES = new Map([
+  ['man utd', 'Manchester United'],
+  ['man united', 'Manchester United'],
+  ['man city', 'Manchester City'],
+  ['psg', 'Paris Saint-Germain'],
+  ['inter miami', 'Inter Miami CF'],
+  ['bayern', 'FC Bayern München'],
+  ['atletico madrid', 'Atlético de Madrid'],
+  ['atletico', 'Atlético de Madrid'],
+  ['ath madrid', 'Atlético de Madrid'],
+  ['spurs', 'Tottenham Hotspur'],
+  ['juve', 'Juventus'],
+  ['ac milan', 'Milano FC'],
+  ['inter', 'Inter'],
+  ['usa', 'United States of America'],
+  ['czech republic', 'Czechia']
+]);
 
 function normalizeText(value) {
   return String(value || '')
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[̀-ͯ]/g, '')
     .toLowerCase()
     .replace(/&/g, ' and ')
     .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\b(fc|cf|sc|afc|if|bk|ac|as|sv|fk|club|de|cd)\b/g, ' ')
+    .replace(/(fc|cf|sc|afc|if|bk|ac|as|sv|fk|club|de|cd|the)/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-}
-
-function scoreCandidateName(teamName, candidate) {
-  const base = normalizeText(teamName);
-  const probe = normalizeText(candidate);
-  if (!base || !probe) return 0;
-  if (base === probe) return 100;
-  if (base.includes(probe) || probe.includes(base)) return 92;
-  const baseWords = new Set(base.split(' '));
-  const probeWords = probe.split(' ').filter(Boolean);
-  const hits = probeWords.filter((word) => baseWords.has(word)).length;
-  if (!probeWords.length) return 0;
-  return Math.round((hits / probeWords.length) * 80);
-}
-
-function matchTeamByName(teams, candidate) {
-  if (!candidate) return null;
-  let best = null;
-  for (const team of teams) {
-    const score = scoreCandidateName(team.name, candidate);
-    if (!best || score > best.score) best = { team, score };
-  }
-  return best && best.score >= 55 ? best : null;
 }
 
 function dataUrlBytes(dataUrl) {
@@ -101,14 +99,134 @@ function dataUrlBytes(dataUrl) {
 
 function sanitizeDataUrl(dataUrl) {
   const value = String(dataUrl || '').trim();
-  if (!/^data:image\/(png|jpeg|jpg|webp);base64,/i.test(value)) {
-    throw new Error('Fotka musí být PNG, JPG nebo WEBP ve formátu base64');
+  if (!/^data:image\/(png|jpeg|jpg|webp|heic|heif);base64,/i.test(value)) {
+    throw new Error('Fotka musí být PNG, JPG, WEBP nebo HEIC ve formátu base64');
   }
   const bytes = dataUrlBytes(value);
-  if (bytes > 8 * 1024 * 1024) {
+  if (bytes > 18 * 1024 * 1024) {
     throw new Error('Fotka je příliš velká i po kompresi. Zkus být blíž TV nebo udělat menší výřez.');
   }
   return value;
+}
+
+function extractJsonBlock(text) {
+  const source = String(text || '');
+  const start = source.indexOf('{');
+  const end = source.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(source.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function buildTeamAliases(team) {
+  const aliases = new Set([team.name]);
+  aliases.add(normalizeText(team.name));
+  if (team.type === 'national') aliases.add(`${team.name} national`);
+  for (const [alias, official] of TEAM_ALIASES.entries()) {
+    if (official === team.name) aliases.add(alias);
+  }
+  return Array.from(aliases).map((alias) => normalizeText(alias)).filter(Boolean);
+}
+
+function scoreCandidateName(teamName, candidate) {
+  const base = normalizeText(teamName);
+  const probe = normalizeText(candidate);
+  if (!base || !probe) return 0;
+  if (base === probe) return 100;
+  if (base.includes(probe) || probe.includes(base)) return Math.max(88, Math.min(98, probe.length * 2));
+  const baseWords = new Set(base.split(' '));
+  const probeWords = probe.split(' ').filter(Boolean);
+  const hits = probeWords.filter((word) => baseWords.has(word)).length;
+  if (!probeWords.length) return 0;
+  const coverage = hits / probeWords.length;
+  const density = hits / Math.max(baseWords.size, 1);
+  return Math.round((coverage * 65) + (density * 25));
+}
+
+function matchTeamByName(teams, candidate) {
+  if (!candidate) return null;
+  let best = null;
+  for (const team of teams) {
+    const aliases = buildTeamAliases(team);
+    const score = aliases.reduce((max, alias) => Math.max(max, scoreCandidateName(alias, candidate)), 0);
+    if (!best || score > best.score) best = { team, score };
+  }
+  return best && best.score >= 55 ? best : null;
+}
+
+async function preprocessImageVariants(imageDataUrl) {
+  const safeImageDataUrl = sanitizeDataUrl(imageDataUrl);
+  const payload = safeImageDataUrl.split(',')[1] || '';
+  const inputBuffer = Buffer.from(payload, 'base64');
+
+  const base = sharp(inputBuffer, { failOn: 'none' }).rotate();
+  const meta = await base.metadata();
+  const resizedWidth = Math.min(2200, Math.max(1400, meta.width || 1600));
+
+  const normal = await base.clone().resize({ width: resizedWidth, withoutEnlargement: false }).jpeg({ quality: 84 }).toBuffer();
+  const enhanced = await base.clone().resize({ width: resizedWidth, withoutEnlargement: false }).grayscale().normalize().sharpen().jpeg({ quality: 88 }).toBuffer();
+  return { safeImageDataUrl, normal, enhanced };
+}
+
+async function recognizeTextFromBuffer(buffer) {
+  const result = await Tesseract.recognize(buffer, 'eng', {
+    logger: () => {},
+    tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK,
+    preserve_interword_spaces: '1'
+  });
+  return result?.data || {};
+}
+
+function scoreTeamAgainstOcr(team, normalizedText, normalizedLines) {
+  const aliases = buildTeamAliases(team);
+  let best = 0;
+  for (const alias of aliases) {
+    if (!alias) continue;
+    if (normalizedText.includes(alias)) best = Math.max(best, 100);
+    for (const line of normalizedLines) {
+      if (!line) continue;
+      if (line === alias) best = Math.max(best, 100);
+      else if (line.includes(alias) || alias.includes(line)) best = Math.max(best, 93);
+      else best = Math.max(best, scoreCandidateName(alias, line));
+    }
+  }
+  return best;
+}
+
+function detectTeamsFromOcr(teams, ocrData) {
+  const text = String(ocrData.text || '');
+  const lineSources = [
+    ...(ocrData.lines || []).map((line) => line.text || ''),
+    ...text.split(/\n+/)
+  ];
+  const normalizedText = normalizeText(text);
+  const normalizedLines = lineSources.map(normalizeText).filter(Boolean);
+
+  const ranked = teams
+    .map((team) => ({ team, score: scoreTeamAgainstOcr(team, normalizedText, normalizedLines) }))
+    .filter((row) => row.score >= 62)
+    .sort((a, b) => b.score - a.score || a.team.name.localeCompare(b.team.name, 'cs'));
+
+  const unique = [];
+  for (const item of ranked) {
+    if (!unique.some((row) => row.team.id === item.team.id)) unique.push(item);
+    if (unique.length >= 6) break;
+  }
+
+  if (unique.length < 2) {
+    throw new Error('Z fotky se nepodařilo přečíst oba týmy dostatečně jistě. Zkus být blíž TV nebo zmenšit záběr.');
+  }
+
+  return {
+    raw: { homeTeam: unique[0].team.name, awayTeam: unique[1].team.name },
+    homeMatch: unique[0],
+    awayMatch: unique[1],
+    source: 'ocr',
+    warning: ''
+  };
 }
 
 async function callOpenAIChatVision(imageDataUrl, teams) {
@@ -156,23 +274,7 @@ async function callOpenAIChatVision(imageDataUrl, teams) {
   return parsed;
 }
 
-function extractJsonBlock(text) {
-  const source = String(text || '');
-  const start = source.indexOf('{');
-  const end = source.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-  try {
-    return JSON.parse(source.slice(start, end + 1));
-  } catch {
-    return null;
-  }
-}
-
-async function extractTeamsFromImage(imageDataUrl, teams) {
-  if (!OPENAI_API_KEY) {
-    throw new Error('Na serveru chybí OPENAI_API_KEY pro čtení týmů z fotky');
-  }
-
+async function extractTeamsViaAi(imageDataUrl, teams) {
   const safeImageDataUrl = sanitizeDataUrl(imageDataUrl);
 
   let parsed = null;
@@ -236,8 +338,37 @@ async function extractTeamsFromImage(imageDataUrl, teams) {
     raw: parsed,
     homeMatch,
     awayMatch,
+    source: 'ai',
     warning: firstError ? String(firstError.message || firstError) : ''
   };
+}
+
+async function extractTeamsFromImage(imageDataUrl, teams) {
+  const variants = await preprocessImageVariants(imageDataUrl);
+  let ocrError = null;
+
+  if (OCR_ENABLED) {
+    try {
+      const ocrData = await recognizeTextFromBuffer(variants.enhanced);
+      const ocrMatch = detectTeamsFromOcr(teams, ocrData);
+      if (!OPENAI_API_KEY) return ocrMatch;
+      try {
+        const aiMatch = await extractTeamsViaAi(variants.safeImageDataUrl, teams);
+        return { ...aiMatch, warning: ocrMatch.warning || aiMatch.warning || '' };
+      } catch (aiError) {
+        return { ...ocrMatch, warning: `AI fallback selhal, použit lokální OCR výsledek: ${String(aiError.message || aiError)}` };
+      }
+    } catch (err) {
+      ocrError = err;
+    }
+  }
+
+  if (OPENAI_API_KEY) {
+    const aiMatch = await extractTeamsViaAi(variants.safeImageDataUrl, teams);
+    return { ...aiMatch, warning: ocrError ? `Lokální OCR selhalo: ${String(ocrError.message || ocrError)}` : aiMatch.warning };
+  }
+
+  throw new Error(ocrError ? `Lokální OCR selhalo: ${String(ocrError.message || ocrError)}` : 'Foto rozpoznání se nepodařilo spustit');
 }
 
 function signToken(name) {
@@ -405,7 +536,15 @@ io.on('connection', (socket) => {
 });
 
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+app.get('/api/health', async (_req, res) => {
+  try {
+    await ensureTeamCatalog();
+    const teamsCount = await prisma.footballTeam.count();
+    res.json({ ok: true, ai: OPENAI_API_KEY ? 'on' : 'off', ocr: OCR_ENABLED ? 'on' : 'off', teamsCatalog: teamsCount > 0 ? `ok:${teamsCount}` : 'empty' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
 
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body || {};
@@ -626,11 +765,12 @@ app.post('/api/matches/:id/extract-teams', auth, async (req, res) => {
       awayTeamId: detected.awayMatch?.team.id || '',
       rawHomeTeam: detected.raw.homeTeam,
       rawAwayTeam: detected.raw.awayTeam,
-      warning: detected.warning || ''
+      warning: detected.warning || '',
+      source: detected.source || 'ocr'
     });
   } catch (err) {
     const message = String(err?.message || 'Čtení týmů z fotky selhalo');
-    const status = /chyb[ií] OPENAI_API_KEY/i.test(message) ? 503 : /příliš velká|formatu base64/i.test(message) ? 413 : 500;
+    const status = /příliš velká|formatu base64/i.test(message) ? 413 : /nepodařilo přečíst oba týmy|lokální ocr selhalo|nepodařilo spustit/i.test(message) ? 422 : 500;
     return res.status(status).json({ error: message });
   }
 });
