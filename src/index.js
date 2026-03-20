@@ -62,22 +62,48 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_APIKEY |
 const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 const OCR_ENABLED = process.env.DISABLE_LOCAL_OCR !== '1';
 
+
+const NATIONAL_TEAM_ALIASES = new Map([
+  ['Argentina', ['Argentina']],
+  ['Croatia', ['Croatia', 'Chorvatsko']],
+  ['Denmark', ['Denmark', 'Dánsko']],
+  ['England', ['England', 'Anglie']],
+  ['France', ['France', 'Francie']],
+  ['Germany', ['Germany', 'Německo']],
+  ['Ghana', ['Ghana']],
+  ['Hungary', ['Hungary', 'Maďarsko']],
+  ['Italy', ['Italy', 'Itálie']],
+  ['Mexico', ['Mexico', 'Mexiko']],
+  ['Morocco', ['Morocco', 'Maroko']],
+  ['Netherlands', ['Netherlands', 'Nizozemsko']],
+  ['Northern Ireland', ['Northern Ireland', 'Severní Irsko']],
+  ['Norway', ['Norway', 'Norsko']],
+  ['Poland', ['Poland', 'Polsko']],
+  ['Portugal', ['Portugal', 'Portugalsko']],
+  ['Republic of Ireland', ['Republic of Ireland', 'Irsko', 'Republika Irsko']],
+  ['Romania', ['Romania', 'Rumunsko']],
+  ['Scotland', ['Scotland', 'Skotsko']],
+  ['Spain', ['Spain', 'Španělsko']],
+  ['Sweden', ['Sweden', 'Švédsko']],
+  ['Ukraine', ['Ukraine', 'Ukrajina']],
+  ['United States of America', ['United States of America', 'USA', 'Spojené státy', 'Spojené státy americké']],
+  ['Wales', ['Wales']]
+]);
+
 const TEAM_ALIASES = new Map([
   ['man utd', 'Manchester United'],
   ['man united', 'Manchester United'],
   ['man city', 'Manchester City'],
   ['psg', 'Paris Saint-Germain'],
-  ['inter miami', 'Inter Miami CF'],
-  ['bayern', 'FC Bayern München'],
-  ['atletico madrid', 'Atlético de Madrid'],
-  ['atletico', 'Atlético de Madrid'],
-  ['ath madrid', 'Atlético de Madrid'],
+  ['bayern', 'Bayern Munich'],
   ['spurs', 'Tottenham Hotspur'],
-  ['juve', 'Juventus'],
-  ['ac milan', 'Milano FC'],
-  ['inter', 'Inter'],
-  ['usa', 'United States of America'],
-  ['czech republic', 'Czechia']
+  ['juve', 'Juventus']
+]);
+
+const OCR_NOISE_WORDS = new Set([
+  'fc', 'ea', 'sports', 'ultimate', 'team', 'ut', 'kick', 'off', 'match', 'pause', 'resume',
+  'stadium', 'settings', 'online', 'squad', 'ready', 'start', 'continue', 'back', 'next',
+  'home', 'away', 'domaci', 'hoste', 'pen', 'pens', 'overtime', 'extra', 'time', 'vs'
 ]);
 
 function normalizeText(value) {
@@ -122,13 +148,48 @@ function extractJsonBlock(text) {
 }
 
 function buildTeamAliases(team) {
-  const aliases = new Set([team.name]);
-  aliases.add(normalizeText(team.name));
-  if (team.type === 'national') aliases.add(`${team.name} national`);
+  const aliases = new Set([team.name, normalizeText(team.name)]);
+  if (team.type === 'national') {
+    aliases.add(`${team.name} national`);
+    for (const alias of NATIONAL_TEAM_ALIASES.get(team.name) || []) aliases.add(alias);
+  }
   for (const [alias, official] of TEAM_ALIASES.entries()) {
     if (official === team.name) aliases.add(alias);
   }
   return Array.from(aliases).map((alias) => normalizeText(alias)).filter(Boolean);
+}
+
+
+function sanitizeOcrLine(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (/^\d+([:\-.]\d+)*$/.test(raw)) return '';
+  if (!/[A-Za-zÀ-ÿ]/.test(raw)) return '';
+  const normalized = normalizeText(raw);
+  if (!normalized || normalized.length < 4) return '';
+  if (normalized.split(' ').every((word) => OCR_NOISE_WORDS.has(word))) return '';
+  return normalized;
+}
+
+function uniquePush(list, value) {
+  if (value && !list.includes(value)) list.push(value);
+}
+
+function collectOcrCandidates(ocrData) {
+  const candidates = [];
+  for (const line of ocrData.lines || []) {
+    uniquePush(candidates, sanitizeOcrLine(line.text || ''));
+  }
+  const words = (ocrData.words || []).map((word) => String(word.text || '').trim()).filter(Boolean);
+  for (let i = 0; i < words.length; i += 1) {
+    uniquePush(candidates, sanitizeOcrLine(words[i]));
+    uniquePush(candidates, sanitizeOcrLine(`${words[i]} ${words[i + 1] || ''}`));
+    uniquePush(candidates, sanitizeOcrLine(`${words[i]} ${words[i + 1] || ''} ${words[i + 2] || ''}`));
+  }
+  for (const line of String(ocrData.text || '').split(/\n+/)) {
+    uniquePush(candidates, sanitizeOcrLine(line));
+  }
+  return candidates.filter(Boolean);
 }
 
 function scoreCandidateName(teamName, candidate) {
@@ -196,38 +257,49 @@ function scoreTeamAgainstOcr(team, normalizedText, normalizedLines) {
   return best;
 }
 
+
 function detectTeamsFromOcr(teams, ocrData) {
-  const text = String(ocrData.text || '');
-  const lineSources = [
-    ...(ocrData.lines || []).map((line) => line.text || ''),
-    ...text.split(/\n+/)
-  ];
-  const normalizedText = normalizeText(text);
-  const normalizedLines = lineSources.map(normalizeText).filter(Boolean);
+  const candidates = collectOcrCandidates(ocrData);
 
   const ranked = teams
-    .map((team) => ({ team, score: scoreTeamAgainstOcr(team, normalizedText, normalizedLines) }))
-    .filter((row) => row.score >= 62)
+    .map((team) => {
+      const aliases = buildTeamAliases(team);
+      let score = 0;
+      let bestCandidate = '';
+      for (const candidate of candidates) {
+        const nextScore = aliases.reduce((max, alias) => Math.max(max, scoreCandidateName(alias, candidate)), 0);
+        if (nextScore > score) {
+          score = nextScore;
+          bestCandidate = candidate;
+        }
+      }
+      return { team, score, bestCandidate };
+    })
+    .filter((row) => row.score >= 72)
     .sort((a, b) => b.score - a.score || a.team.name.localeCompare(b.team.name, 'cs'));
 
   const unique = [];
   for (const item of ranked) {
     if (!unique.some((row) => row.team.id === item.team.id)) unique.push(item);
-    if (unique.length >= 6) break;
+    if (unique.length >= 4) break;
   }
 
   if (unique.length < 2) {
-    throw new Error('Z fotky se nepodařilo přečíst oba týmy dostatečně jistě. Zkus být blíž TV nebo zmenšit záběr.');
+    throw new Error('Z kamery se nepodařilo přečíst oba týmy dostatečně jistě. Zkus být blíž TV a namiř rámeček jen na názvy týmů.');
   }
 
   return {
-    raw: { homeTeam: unique[0].team.name, awayTeam: unique[1].team.name },
+    raw: {
+      homeTeam: unique[0].bestCandidate || unique[0].team.name,
+      awayTeam: unique[1].bestCandidate || unique[1].team.name
+    },
     homeMatch: unique[0],
     awayMatch: unique[1],
     source: 'ocr',
     warning: ''
   };
 }
+
 
 async function callOpenAIChatVision(imageDataUrl, teams) {
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -246,7 +318,7 @@ async function callOpenAIChatVision(imageDataUrl, teams) {
           {
             type: 'text',
             text:
-              'Na fotce je výběr týmů v EA SPORTS FC 26 na TV obrazovce. Najdi pouze dva zvolené mužské týmy. ' +
+              'Na fotce je obrazovka EA SPORTS FC 26 na TV. Ignoruj všechna čísla, skóre, čas, menu i ostatní text. Najdi pouze dva názvy týmů. ' +
               'Vrať jen JSON ve tvaru {"homeTeam":"...","awayTeam":"..."}. ' +
               'Neuváděj žádný další text. Dostupné týmy jsou: ' + teams.map((team) => team.name).join(', ')
           },
@@ -295,7 +367,7 @@ async function extractTeamsViaAi(imageDataUrl, teams) {
             {
               type: 'input_text',
               text:
-                'Na fotce je výběr týmů v EA SPORTS FC 26 na TV obrazovce. Najdi pouze dva zvolené mužské týmy. ' +
+                'Na fotce je obrazovka EA SPORTS FC 26 na TV. Ignoruj všechna čísla, skóre, čas, menu i ostatní text. Najdi pouze dva názvy týmů. ' +
                 'Vrať jen JSON ve tvaru {"homeTeam":"...","awayTeam":"..."}. ' +
                 'Použij co nejpřesnější oficiální názvy. Dostupné týmy jsou: ' + teams.map((team) => team.name).join(', ')
             },
@@ -715,6 +787,16 @@ app.patch('/api/matches/:id', auth, async (req, res) => {
   if (current.tournament?.status === 'closed' && !req.user?.isNojby) return res.status(400).json({ error: 'Uzavřený turnaj už nelze upravovat' });
 
   const { scoreA, scoreB, overtimeWinner, auctionA, auctionB, footballTeamAId, footballTeamBId } = req.body || {};
+
+  if (!footballTeamAId || !footballTeamBId) {
+    return res.status(400).json({ error: 'Vyber oba týmy, jinak zápas nelze uložit' });
+  }
+  if (String(footballTeamAId) === String(footballTeamBId)) {
+    return res.status(400).json({ error: 'Stejný tým nelze použít na obou stranách zápasu' });
+  }
+  if (scoreA != null && scoreB != null && Number(scoreA) === Number(scoreB) && !overtimeWinner) {
+    return res.status(400).json({ error: 'Při remíze je nutné zvolit vítěze prodloužení' });
+  }
 
   if (footballTeamAId || footballTeamBId) {
     const used = await prisma.match.findMany({

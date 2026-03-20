@@ -53,19 +53,21 @@ function calculateTournament(tournament) {
 
     const teamA = [match.teamAPlayer1Id, match.teamAPlayer2Id];
     const teamB = [match.teamBPlayer1Id, match.teamBPlayer2Id];
+    const adjustedScoreA = Number(match.scoreA) + (Number(match.scoreA) === Number(match.scoreB) && match.overtimeWinner === 'A' ? 1 : 0);
+    const adjustedScoreB = Number(match.scoreB) + (Number(match.scoreA) === Number(match.scoreB) && match.overtimeWinner === 'B' ? 1 : 0);
 
     for (const id of teamA) {
       rows[id].played += 1;
-      rows[id].goalsFor += match.scoreA;
-      rows[id].goalsAgainst += match.scoreB;
+      rows[id].goalsFor += adjustedScoreA;
+      rows[id].goalsAgainst += adjustedScoreB;
       rows[id].goalDiff = rows[id].goalsFor - rows[id].goalsAgainst;
       rows[id].auctionCost += match.auctionA || 0;
       rows[id].totalCosts += match.auctionA || 0;
     }
     for (const id of teamB) {
       rows[id].played += 1;
-      rows[id].goalsFor += match.scoreB;
-      rows[id].goalsAgainst += match.scoreA;
+      rows[id].goalsFor += adjustedScoreB;
+      rows[id].goalsAgainst += adjustedScoreA;
       rows[id].goalDiff = rows[id].goalsFor - rows[id].goalsAgainst;
       rows[id].auctionCost += match.auctionB || 0;
       rows[id].totalCosts += match.auctionB || 0;
