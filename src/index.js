@@ -414,11 +414,22 @@ async function loadTournament(id) {
 
 
 async function ensureTeamCatalog() {
-  const count = await prisma.footballTeam.count();
-  if (count >= teamCatalog.length) return;
+  const existing = await prisma.footballTeam.findMany({ select: { name: true } });
+  const existingNames = new Set(existing.map((row) => row.name));
+  const missing = teamCatalog.filter(([name]) => !existingNames.has(name));
+  if (!missing.length) return;
   await prisma.footballTeam.createMany({
-    data: teamCatalog.map(([name, country, competition, type]) => ({ name, country, competition, type })),
+    data: missing.map(([name, country, competition, type]) => ({ name, country, competition, type })),
     skipDuplicates: true
+  });
+}
+
+async function loadAllowedTeams() {
+  await ensureTeamCatalog();
+  const allowedNames = teamCatalog.map(([name]) => name);
+  return prisma.footballTeam.findMany({
+    where: { name: { in: allowedNames } },
+    orderBy: [{ country: 'asc' }, { competition: 'asc' }, { name: 'asc' }]
   });
 }
 
@@ -538,8 +549,7 @@ io.on('connection', (socket) => {
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 app.get('/api/health', async (_req, res) => {
   try {
-    await ensureTeamCatalog();
-    const teamsCount = await prisma.footballTeam.count();
+    const teamsCount = (await loadAllowedTeams()).length;
     res.json({ ok: true, ai: OPENAI_API_KEY ? 'on' : 'off', ocr: OCR_ENABLED ? 'on' : 'off', teamsCatalog: teamsCount > 0 ? `ok:${teamsCount}` : 'empty' });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err?.message || err) });
@@ -558,8 +568,7 @@ app.post('/api/auth/login', (req, res) => {
 app.get('/api/me', auth, (req, res) => res.json({ user: req.user }));
 
 app.get('/api/teams', auth, async (_req, res) => {
-  await ensureTeamCatalog();
-  const teams = await prisma.footballTeam.findMany({ orderBy: [{ country: 'asc' }, { competition: 'asc' }, { name: 'asc' }] });
+  const teams = await loadAllowedTeams();
   res.json(teams);
 });
 
@@ -745,7 +754,6 @@ app.patch('/api/matches/:id', auth, async (req, res) => {
 
 
 app.post('/api/matches/:id/extract-teams', auth, async (req, res) => {
-  await ensureTeamCatalog();
   const { imageDataUrl } = req.body || {};
   if (!imageDataUrl || typeof imageDataUrl !== 'string') {
     return res.status(400).json({ error: 'Chybí fotka pro vytěžení týmů' });
@@ -757,7 +765,7 @@ app.post('/api/matches/:id/extract-teams', auth, async (req, res) => {
     return res.status(400).json({ error: 'Uzavřený turnaj už nelze upravovat' });
   }
 
-  const teams = await prisma.footballTeam.findMany({ orderBy: [{ country: 'asc' }, { competition: 'asc' }, { name: 'asc' }] });
+  const teams = await loadAllowedTeams();
   try {
     const detected = await extractTeamsFromImage(imageDataUrl, teams);
     return res.json({
